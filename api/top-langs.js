@@ -32,7 +32,8 @@ export default async (req, res) => {
     cache_seconds,
     layout,
     langs_count,
-    exclude_repo,
+        exclude_repo,
+    orgs,
     size_weight,
     count_weight,
     custom_title,
@@ -123,6 +124,7 @@ export default async (req, res) => {
       parseArray(exclude_repo),
       size_weight,
       count_weight,
+      parseArray(orgs),
     );
     const cacheSeconds = resolveCacheSeconds({
       requested: parseInt(cache_seconds, 10),
