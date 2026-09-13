@@ -20,10 +20,53 @@ const fetcher = (variables, token) => {
       query: `
       query userInfo($login: String!) {
         user(login: $login) {
-          # fetch only owner repos & not forks
-                    repositories(ownerAffiliations: [OWNER, ORGANIZATION_MEMBER, COLLABORATOR], isFork: false, first: 100) {
+          # owner, org-member and collaborator repos, excluding forks
+          repositories(ownerAffiliations: [OWNER, ORGANIZATION_MEMBER, COLLABORATOR], isFork: false, first: 100) {
             nodes {
               name
+              nameWithOwner
+              languages(first: 10, orderBy: {field: SIZE, direction: DESC}) {
+                edges {
+                  size
+                  node {
+                    color
+                    name
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      `,
+      variables,
+    },
+    {
+      Authorization: `token ${token}`,
+    },
+  );
+};
+
+/**
+ * Organization repositories fetcher.
+ *
+ * Repos owned by an organization are not returned by the user query unless the
+ * caller reaches them through team membership, so they are fetched separately.
+ *
+ * @param {any} variables Fetcher variables.
+ * @param {string} token GitHub token.
+ * @returns {Promise<import("axios").AxiosResponse>} Languages fetcher response.
+ */
+const orgFetcher = (variables, token) => {
+  return request(
+    {
+      query: `
+      query orgInfo($org: String!) {
+        organization(login: $org) {
+          repositories(isFork: false, first: 100) {
+            nodes {
+              name
+              nameWithOwner
               languages(first: 10, orderBy: {field: SIZE, direction: DESC}) {
                 edges {
                   size
@@ -57,6 +100,7 @@ const fetcher = (variables, token) => {
  * @param {string[]} exclude_repo List of repositories to exclude.
  * @param {number} size_weight Weightage to be given to size.
  * @param {number} count_weight Weightage to be given to count.
+ * @param {string[]} orgs Organizations whose repositories should also be counted.
  * @returns {Promise<TopLangData>} Top languages data.
  */
 const fetchTopLanguages = async (
@@ -64,6 +108,7 @@ const fetchTopLanguages = async (
   exclude_repo = [],
   size_weight = 1,
   count_weight = 0,
+  orgs = [],
 ) => {
   if (!username) {
     throw new MissingParamError(["username"]);
@@ -92,6 +137,40 @@ const fetchTopLanguages = async (
   }
 
   let repoNodes = res.data.data.user.repositories.nodes;
+
+  // Pull in organization repositories and merge them with the user's own,
+  // de-duplicating on nameWithOwner so a repo reachable through both paths is
+  // not counted twice.
+  if (orgs.length > 0) {
+    const seen = new Set(repoNodes.map((node) => node.nameWithOwner));
+
+    for (const org of orgs) {
+      try {
+        const orgRes = await retryer(orgFetcher, { org });
+
+        if (orgRes.data.errors) {
+          logger.error(`Skipping org "${org}":`, orgRes.data.errors);
+          continue;
+        }
+
+        const orgNodes = orgRes.data.data?.organization?.repositories?.nodes;
+        if (!orgNodes) {
+          continue;
+        }
+
+        for (const node of orgNodes) {
+          if (!seen.has(node.nameWithOwner)) {
+            seen.add(node.nameWithOwner);
+            repoNodes.push(node);
+          }
+        }
+      } catch (err) {
+        // A single unreachable org should not fail the whole card.
+        logger.error(`Failed to fetch org "${org}":`, err);
+      }
+    }
+  }
+
   /** @type {Record<string, boolean>} */
   let repoToHide = {};
   const allExcludedRepos = [...exclude_repo, ...excludeRepositories];
@@ -104,10 +183,11 @@ const fetchTopLanguages = async (
     });
   }
 
-  // filter out repositories to be hidden
+  // filter out repositories to be hidden, matching on either the bare name or
+  // the fully qualified owner/name form
   repoNodes = repoNodes
     .sort((a, b) => b.size - a.size)
-    .filter((name) => !repoToHide[name.name]);
+    .filter((repo) => !repoToHide[repo.name] && !repoToHide[repo.nameWithOwner]);
 
   let repoCount = 0;
 
